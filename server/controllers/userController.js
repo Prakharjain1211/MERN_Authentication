@@ -3,6 +3,8 @@ import { catchAsyncError } from "../middleware/catchAsyncError.js";
 import ErrorHandler from "../middleware/error.js";
 import { User } from "../models/userModel.js";
 import { sendEmail } from "../utils/sendEmail.js";
+import { sendToken } from "../utils/sendToken.js";
+import crypto from "crypto";
 
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 
@@ -16,9 +18,11 @@ export const register = catchAsyncError(async (req, res, next) => {
       const phoneRegex = /^\+91\d{10}$/;
       return phoneRegex.test(phone);
     }
+
     if (!validatePhoneNumber(phone)) {
       return next(new ErrorHandler("Invalid phone number.", 400));
     }
+
     const existingUser = await User.findOne({
       $or: [
         {
@@ -31,9 +35,11 @@ export const register = catchAsyncError(async (req, res, next) => {
         },
       ],
     });
+
     if (existingUser) {
       return next(new ErrorHandler("Phone or Email is already used.", 400));
     }
+
     const registerationAttemptsByUser = await User.find({
       $or: [
         { phone, accountVerified: false },
@@ -49,16 +55,25 @@ export const register = catchAsyncError(async (req, res, next) => {
         )
       );
     }
+
     const userData = {
       name,
       email,
       phone,
       password,
     };
+
     const user = await User.create(userData);
-    const verificationCode = await user.generateVerficationCode();
+    const verificationCode = await user.generateVerificationCode();
     await user.save();
-    sendVerificationCode(verificationMethod, verificationCode, name, email, phone,res);
+    sendVerificationCode(
+      verificationMethod,
+      verificationCode,
+      name,
+      email,
+      phone,
+      res
+    );
   } catch (error) {
     next(error);
   }
@@ -77,8 +92,8 @@ async function sendVerificationCode(
       const message = generateEmailTemplate(verificationCode);
       sendEmail({ email, subject: "Your Verification Code", message });
       res.status(200).json({
-        success:true,
-        message: `verification email successfully send to ${name}`
+        success: true,
+        message: `Verification email successfully sent to ${name}`,
       });
     } else if (verificationMethod === "phone") {
       const verificationCodeWithSpace = verificationCode
@@ -86,24 +101,25 @@ async function sendVerificationCode(
         .split("")
         .join(" ");
       await client.calls.create({
-        twiml: `<Response><Say>Your verification code is ${verificationCodeWithSpace}.Your verification code is ${verificationCodeWithSpace}. </Say></Response>`,
+        twiml: `<Response><Say>Your verification code is ${verificationCodeWithSpace}. Your verification code is ${verificationCodeWithSpace}.</Say></Response>`,
         from: process.env.TWILIO_PHONE_NUMBER,
         to: phone,
       });
       res.status(200).json({
-        success:true,
-        message: `OTP send to ${name}.`
+        success: true,
+        message: `OTP sent.`,
       });
     } else {
-      return  res.status(200).json({
+      return res.status(500).json({
         success: false,
-        message:"Invalid Verification method."
+        message: "Invalid verification method.",
       });
     }
   } catch (error) {
-    return  res.status(200).json({
+    console.log(error);
+    return res.status(500).json({
       success: false,
-      message:"Verification code failed to send."
+      message: "Verification code failed to send.",
     });
   }
 }
@@ -128,3 +144,167 @@ function generateEmailTemplate(verificationCode) {
     </div>
   `;
 }
+
+export const verifyOTP = catchAsyncError(async (req, res, next) => {
+  const { email, otp, phone } = req.body;
+  function validatePhoneNumber(phone) {
+    const phoneRegex = /^\+91\d{10}$/;
+    return phoneRegex.test(phone);
+  }
+  if (!validatePhoneNumber(phone)) {
+    return next(new ErrorHandler("Invalid phone number.", 400));
+  }
+  try {
+    const userAllEntries = await User.find({
+      $or: [
+        {
+          email,
+          accountVerified: false,
+        },
+        {
+          phone,
+          accountVerified: false,
+        },
+      ],
+    }).sort({ createdAt: -1 });
+    if (!userAllEntries) {
+      return next(new ErrorHandler("User not found.", 404));
+    }
+    let user;
+    if (userAllEntries.length > 1) {
+      user = userAllEntries[0];
+      await User.deleteMany({
+        _id: { $ne: user._id },
+        $or: [
+          { phone, accountVerified: false },
+          { email, accountVerified: false },
+        ],
+      });
+    } else {
+      user = userAllEntries[0];
+    }
+    if (user.verificationCode !== Number(otp)) {
+      return next(new ErrorHandler("Invalid OTP.", 400));
+    }
+    const currentTime = Date.now();
+    const verificationCodeExpire = new Date(
+      user.verificationCodeExpire
+    ).getTime();
+    console.log(currentTime);
+    console.log(verificationCodeExpire);
+    if (currentTime > verificationCodeExpire) {
+      return next(new ErrorHandler("OTP Expired.", 400));
+    }
+    user.accountVerified = true;
+    user.verificationCode = null;
+    user.verificationCodeExpire = null;
+    await user.save({ validateModifiedOnly: true });
+    sendToken(user, 200, "Account Verified.", res);
+  } catch (error) {
+    return next(new ErrorHandler("Internal Server Error.", 500));
+  }
+});
+
+export const login = catchAsyncError(async (req, res, next) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return next(new ErrorHandler("Email and password are required.", 400));
+  }
+  const user = await User.findOne({ email, accountVerified: true }).select(
+    "+password"
+  );
+  if (!user) {
+    return next(new ErrorHandler("Invalid email or password.", 400));
+  }
+  const isPasswordMatched = await user.comparePassword(password);
+  if (!isPasswordMatched) {
+    return next(new ErrorHandler("Invalid email or password.", 400));
+  }
+  sendToken(user, 200, "User logged in successfully.", res);
+});
+
+export const logout = catchAsyncError(async (req, res, next) => {
+  res
+    .status(200)
+    .cookie("token", "", {
+      expires: new Date(Date.now()),
+      httpOnly: true,
+    })
+    .json({
+      success: true,
+      message: "Logged out successfully.",
+    });
+});
+
+export const getUser = catchAsyncError(async (req, res, next) => {
+  const user = req.user;
+  res.status(200).json({
+    success: true,
+    user,
+  });
+});
+
+export const forgotPassword = catchAsyncError(async (req, res, next) => {
+  const user = await User.findOne({
+    email: req.body.email,
+    accountVerified: true,
+  });
+  if (!user) {
+    return next(new ErrorHandler("User not found.", 404));
+  }
+  const resetToken = user.generateResetPasswordToken();
+  await user.save({ validateBeforeSave: false });
+  const resetPasswordUrl = `${process.env.FRONTEND_URL}/password/reset/${resetToken}`;
+  const message = `Your Reset Password Token is :- \n\n${resetPasswordUrl} \n\n If you have not requested this mail then please ignore it.`;
+  try {
+    sendEmail({
+      email: user.email,
+      subject: "Mern Authentication App Reset Password",
+      message,
+    });
+    res.status(200).json({
+      success: true,
+      message: `Email send to ${user.email} successfully.`,
+    });
+  } catch (error) {
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    await user.save({ validateBeforeSave: false });
+    return next(
+      new ErrorHandler(
+        error.message ? error.message : "Cannot send reset password token.",
+        500
+      )
+    );
+  }
+});
+
+export const resetPassword = catchAsyncError(async (req, res, next) => {
+  const { token } = req.params;
+  const resetPasswordToken = crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+  const user = await User.findOne({
+    resetPasswordToken,
+    resetPasswordExpire: { $gt: Date.now() },
+  });
+  if (!user) {
+    return next(
+      new ErrorHandler(
+        "Reset password token is invalid or has been expired.",
+        400
+      )
+    );
+  }
+  if (req.body.password !== req.body.confirmPassword) {
+    return next(
+      new ErrorHandler("Password & confirm password do not match.", 400)
+    );
+  }
+  user.password = req.body.password;
+  user.resetPasswordToken = undefined;
+  user.resetPasswordExpire = undefined;
+  await user.save();
+  sendToken(user, 200, "Reset Password Successfully.", res);
+});

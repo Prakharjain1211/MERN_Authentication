@@ -1,6 +1,8 @@
 //! Importing required modules
 import mongoose from "mongoose"; // Mongoose is used to define schemas and interact with MongoDB.
 import bcrypt from "bcrypt"; // Bcrypt is used for hashing passwords securely.
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 //! Defining the user schema
 const userSchema = new mongoose.Schema({
@@ -55,6 +57,22 @@ userSchema.methods.generateVerificationCode = function () {
   this.verificationCodeExpire = Date.now() + 5 * 60 * 1000; // Set expiration time (5 minutes, but incorrect calculation)
   return verificationCode; // Return the generated code
 };
+
+userSchema.methods.generateToken = function () {
+  return jwt.sign({ id: this._id }, process.env.JWT_SECRET_KEY, {
+    expiresIn: process.env.JWT_EXPIRE,
+  });
+};
+
+userSchema.methods.generateResetPasswordToken = function () {
+  const resetToken = crypto.randomBytes(20).toString("hex");
+  this.resetPasswordToken = crypto
+    .createHash("sha256")
+    .update(resetToken)
+    .digest("hex");
+  this.resetPasswordExpire = Date.now() + 15 * 60 * 1000
+  return resetToken;
+}
 
 //! Exporting the User model
 export const User = mongoose.model("User", userSchema); // Creates a Mongoose model named "User" based on the schema

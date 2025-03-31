@@ -5,6 +5,7 @@ import cors from "cors";
 import { connection } from "./database/dbConnection.js";
 import { errorMiddleware } from "./middleware/error.js";
 import userRouter from "./routes/userRouter.js";
+import { removeUnverifiedAccounts } from "./automation/removeUnverifiedAccounts.js";
 
 export const app = express();
 config({ path: "./config.env" });
@@ -19,5 +20,6 @@ app.use(cookieParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use("/api/v1", userRouter);
+removeUnverifiedAccounts();
 connection();
 app.use(errorMiddleware);
